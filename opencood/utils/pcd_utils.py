@@ -9,7 +9,12 @@ Utility functions related to point cloud
 
 import open3d as o3d
 import numpy as np
-from pypcd import pypcd
+import io
+
+try:
+    from pypcd import pypcd
+except Exception:
+    pypcd = None
 
 def pcd_to_np(pcd_file):
     """
@@ -202,7 +207,88 @@ def downsample_lidar_minimum(pcd_np_list):
 
     return pcd_np_list
 
+def _pcd_numpy_dtype(fields, sizes, types, counts):
+    type_map = {
+        ("F", 4): "f4",
+        ("F", 8): "f8",
+        ("I", 1): "i1",
+        ("I", 2): "i2",
+        ("I", 4): "i4",
+        ("I", 8): "i8",
+        ("U", 1): "u1",
+        ("U", 2): "u2",
+        ("U", 4): "u4",
+        ("U", 8): "u8",
+    }
+    dtype = []
+    for field, size, type_, count in zip(fields, sizes, types, counts):
+        np_type = type_map[(type_.upper(), int(size))]
+        count = int(count)
+        if count == 1:
+            dtype.append((field, np_type))
+        else:
+            dtype.append((field, np_type, (count,)))
+    return np.dtype(dtype)
+
+
+def _read_pcd_without_pypcd(pcd_path):
+    header = {}
+    header_lines = []
+    with open(pcd_path, "rb") as f:
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError("Invalid PCD file: missing DATA line")
+            decoded = line.decode("utf-8", errors="ignore").strip()
+            header_lines.append(decoded)
+            if decoded.startswith("#") or not decoded:
+                continue
+            key, *values = decoded.split()
+            header[key.upper()] = values
+            if key.upper() == "DATA":
+                data_bytes = f.read()
+                break
+
+    fields = header["FIELDS"]
+    sizes = [int(v) for v in header["SIZE"]]
+    types = header["TYPE"]
+    counts = [int(v) for v in header.get("COUNT", ["1"] * len(fields))]
+    points = int(header.get("POINTS", [header.get("WIDTH", ["0"])[0]])[0])
+    data_kind = header["DATA"][0].lower()
+
+    if data_kind == "ascii":
+        arr = np.loadtxt(io.BytesIO(data_bytes), dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        columns = {name: arr[:, idx] for idx, name in enumerate(fields)}
+    elif data_kind == "binary":
+        dtype = _pcd_numpy_dtype(fields, sizes, types, counts)
+        arr = np.frombuffer(data_bytes, dtype=dtype, count=points)
+        columns = {name: arr[name] for name in fields}
+    else:
+        raise ValueError("Unsupported PCD DATA format: %s" % data_kind)
+
+    intensity = columns.get("intensity")
+    if intensity is None:
+        intensity = np.zeros_like(columns["x"], dtype=np.float32)
+    else:
+        intensity = intensity / 256.0
+
+    pcd_np_points = np.stack(
+        [columns["x"], columns["y"], columns["z"], intensity],
+        axis=-1
+    ).astype(np.float32)
+    return pcd_np_points
+
+
 def read_pcd(pcd_path):
+    if pypcd is None:
+        pcd_np_points = _read_pcd_without_pypcd(pcd_path)
+        time = None
+        del_index = np.where(np.isnan(pcd_np_points))[0]
+        pcd_np_points = np.delete(pcd_np_points, del_index, axis=0)
+        return pcd_np_points, time
+
     pcd = pypcd.PointCloud.from_path(pcd_path)
     time = None
     pcd_np_points = np.zeros((pcd.points, 4), dtype=np.float32)
