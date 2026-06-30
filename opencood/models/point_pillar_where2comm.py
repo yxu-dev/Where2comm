@@ -12,7 +12,6 @@ from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
 from opencood.models.sub_modules.base_bev_backbone_resnet import ResNetBEVBackbone
 from opencood.models.sub_modules.downsample_conv import DownsampleConv
 from opencood.models.sub_modules.naive_compress import NaiveCompressor
-from opencood.models.sub_modules.dcn_net import DCNNet
 # from opencood.models.fuse_modules.where2comm import Where2comm
 from opencood.models.fuse_modules.where2comm_attn import Where2comm
 import torch
@@ -45,6 +44,7 @@ class PointPillarWhere2comm(nn.Module):
 
         self.dcn = False
         if 'dcn' in args:
+            from opencood.models.sub_modules.dcn_net import DCNNet
             self.dcn = True
             self.dcn_net = DCNNet(args['dcn'])
 
