@@ -10,6 +10,7 @@ Utility functions related to point cloud
 import open3d as o3d
 import numpy as np
 import io
+import struct
 
 try:
     from pypcd import pypcd
@@ -231,6 +232,88 @@ def _pcd_numpy_dtype(fields, sizes, types, counts):
     return np.dtype(dtype)
 
 
+def _lzf_decompress(data, expected_size):
+    """
+    Decompress PCL binary_compressed PCD payloads.
+
+    PCD binary_compressed uses LZF. Keeping a small decoder here avoids adding
+    a fragile pypcd/python-lzf dependency just for DAIR-V2X point clouds.
+    """
+    data = memoryview(data)
+    out = bytearray()
+    ip = 0
+    data_len = len(data)
+
+    while ip < data_len:
+        ctrl = data[ip]
+        ip += 1
+
+        if ctrl < 32:
+            length = ctrl + 1
+            if ip + length > data_len:
+                raise ValueError("Invalid LZF stream: literal overruns input")
+            out.extend(data[ip:ip + length])
+            ip += length
+            continue
+
+        length = ctrl >> 5
+        ref_offset = (ctrl & 0x1f) << 8
+        if length == 7:
+            if ip >= data_len:
+                raise ValueError("Invalid LZF stream: missing length byte")
+            length += data[ip]
+            ip += 1
+
+        if ip >= data_len:
+            raise ValueError("Invalid LZF stream: missing offset byte")
+        ref_offset += data[ip]
+        ip += 1
+
+        ref_pos = len(out) - ref_offset - 1
+        if ref_pos < 0:
+            raise ValueError("Invalid LZF stream: bad back-reference")
+
+        length += 2
+        for _ in range(length):
+            out.append(out[ref_pos])
+            ref_pos += 1
+
+    if len(out) != expected_size:
+        raise ValueError(
+            "Invalid LZF stream: expected %d bytes, got %d"
+            % (expected_size, len(out))
+        )
+    return bytes(out)
+
+
+def _read_binary_compressed_pcd(data_bytes, dtype, fields, points):
+    if len(data_bytes) < 8:
+        raise ValueError("Invalid binary_compressed PCD: missing size header")
+
+    compressed_size, uncompressed_size = struct.unpack("<II", data_bytes[:8])
+    compressed = data_bytes[8:8 + compressed_size]
+    if len(compressed) != compressed_size:
+        raise ValueError("Invalid binary_compressed PCD: truncated payload")
+
+    raw = _lzf_decompress(compressed, uncompressed_size)
+    arr = np.empty(points, dtype=dtype)
+
+    offset = 0
+    for field in fields:
+        field_dtype = dtype.fields[field][0]
+        nbytes = field_dtype.itemsize * points
+        if offset + nbytes > len(raw):
+            raise ValueError(
+                "Invalid binary_compressed PCD: field %s overruns payload"
+                % field
+            )
+        arr[field] = np.frombuffer(raw, dtype=field_dtype,
+                                   count=points, offset=offset)
+        offset += nbytes
+
+    return arr
+
+
 def _read_pcd_without_pypcd(pcd_path):
     header = {}
     header_lines = []
@@ -264,6 +347,10 @@ def _read_pcd_without_pypcd(pcd_path):
     elif data_kind == "binary":
         dtype = _pcd_numpy_dtype(fields, sizes, types, counts)
         arr = np.frombuffer(data_bytes, dtype=dtype, count=points)
+        columns = {name: arr[name] for name in fields}
+    elif data_kind == "binary_compressed":
+        dtype = _pcd_numpy_dtype(fields, sizes, types, counts)
+        arr = _read_binary_compressed_pcd(data_bytes, dtype, fields, points)
         columns = {name: arr[name] for name in fields}
     else:
         raise ValueError("Unsupported PCD DATA format: %s" % data_kind)
