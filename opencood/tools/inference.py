@@ -12,6 +12,10 @@ from torch.utils.data import DataLoader
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import train_utils, inference_utils
+from opencood.tools.quantization.quantize_model import (
+    apply_w8a8_fake_quant,
+    list_quantizable_modules,
+)
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
 from opencood.visualization import simple_vis
@@ -33,8 +37,51 @@ def test_parser():
                         help='Set the checkpoint')
     parser.add_argument('--comm_thre', type=float, default=None,
                         help='Communication confidence threshold')
+    parser.add_argument('--quant_mode', type=str, default='none',
+                        choices=['none', 'w8a8_fake'],
+                        help='none or w8a8_fake')
+    parser.add_argument('--quant_scope', type=str, default='full',
+                        choices=['full', 'pillar_vfe', 'backbone',
+                                 'shrink_compression', 'fusion_attention',
+                                 'comm_confidence', 'head', 'combined'],
+                        help='module scope for fake quant')
+    parser.add_argument('--print_quant_modules', action='store_true',
+                        help='print quantizable/selected modules and exit')
     opt = parser.parse_args()
     return opt
+
+
+def _print_quant_modules(model, scope):
+    rows = list_quantizable_modules(model, scope=scope)
+    print('[Quant] quantizable module list:')
+    for row in rows:
+        marker = '[x]' if row['selected'] else '[ ]'
+        print(f"{marker} {row['name']} ({row['type']})")
+    selected_count = sum(row['selected'] for row in rows)
+    print(f"[Quant] selected {selected_count} / {len(rows)} modules "
+          f"for scope={scope}")
+
+
+def _apply_quantization(model, opt):
+    if opt.print_quant_modules:
+        _print_quant_modules(model, opt.quant_scope)
+        return True
+
+    if opt.quant_mode == 'w8a8_fake':
+        report = apply_w8a8_fake_quant(
+            model,
+            scope=opt.quant_scope,
+            weight_bits=8,
+            activation_bits=8,
+        )
+        print('[Quant] W8A8 fake quant report:')
+        print(report)
+        if report['num_quantized'] == 0:
+            raise RuntimeError(
+                f"quant_scope={opt.quant_scope} selected 0 modules. "
+                "Check module names and SCOPE_PATTERNS."
+            )
+    return False
 
 
 def main():
@@ -51,16 +98,6 @@ def main():
     left_hand = True if "OPV2V" in hypes['test_dir'] else False
     print(f"Left hand visualizing: {left_hand}")
 
-    print('Dataset Building')
-    opencood_dataset = build_dataset(hypes, visualize=True, train=False)
-    data_loader = DataLoader(opencood_dataset,
-                             batch_size=1,
-                             num_workers=4,
-                             collate_fn=opencood_dataset.collate_batch_test,
-                             shuffle=False,
-                             pin_memory=False,
-                             drop_last=False)
-
     print('Creating Model')
     model = train_utils.create_model(hypes)
     # we assume gpu is necessary
@@ -75,8 +112,20 @@ def main():
         epoch_id, model = train_utils.load_saved_model(saved_path, model, epoch_id)
     else:
         epoch_id, model = train_utils.load_saved_model(saved_path, model)
-        
+
+    if _apply_quantization(model, opt):
+        return
     model.eval()
+
+    print('Dataset Building')
+    opencood_dataset = build_dataset(hypes, visualize=True, train=False)
+    data_loader = DataLoader(opencood_dataset,
+                             batch_size=1,
+                             num_workers=4,
+                             collate_fn=opencood_dataset.collate_batch_test,
+                             shuffle=False,
+                             pin_memory=False,
+                             drop_last=False)
 
     # Create the dictionary for evaluation
     result_stat = {0.3: {'tp': [], 'fp': [], 'gt': 0},
