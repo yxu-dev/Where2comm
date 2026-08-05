@@ -1,3 +1,4 @@
+import hashlib
 import re
 
 import torch.nn as nn
@@ -54,22 +55,58 @@ SCOPE_PATTERNS = {
     ],
 }
 
-
-def _matches_scope(module_name, scope):
-    if scope not in SCOPE_PATTERNS:
-        raise ValueError(f"Unknown quant_scope: {scope}")
-    return any(re.search(pattern, module_name, re.IGNORECASE)
-               for pattern in SCOPE_PATTERNS[scope])
+SINGLE_SCOPE_CHOICES = tuple(SCOPE_PATTERNS)
+MULTI_SCOPE_CHOICES = tuple(
+    scope for scope in SCOPE_PATTERNS if scope != "combined"
+)
 
 
-def list_quantizable_modules(model, scope="full"):
+def normalize_scopes(scope="full", scopes=None):
+    if scopes is None:
+        components = [scope or "full"]
+    else:
+        components = list(scopes)
+
+    if not components:
+        raise ValueError("At least one quantization scope is required")
+
+    unknown = sorted(set(components) - set(SCOPE_PATTERNS))
+    if unknown:
+        raise ValueError("Unknown quant_scope(s): {}".format(
+            ", ".join(unknown)))
+
+    components = sorted(set(components))
+    if len(components) > 1 and "full" in components:
+        raise ValueError("full cannot be combined with other quantization scopes")
+    if len(components) > 1 and "combined" in components:
+        raise ValueError(
+            "legacy combined cannot be combined with other quantization scopes")
+    return components
+
+
+def module_set_sha256(module_names):
+    payload = "".join("{}\n".format(name)
+                      for name in sorted(module_names)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _matches_scopes(module_name, scope_components):
+    return any(
+        re.search(pattern, module_name, re.IGNORECASE)
+        for scope in scope_components
+        for pattern in SCOPE_PATTERNS[scope]
+    )
+
+
+def list_quantizable_modules(model, scope="full", scopes=None):
+    scope_components = normalize_scopes(scope=scope, scopes=scopes)
     rows = []
     for name, module in model.named_modules():
         if isinstance(module, SUPPORTED_TYPES):
             rows.append({
                 "name": name,
                 "type": module.__class__.__name__,
-                "selected": _matches_scope(name, scope),
+                "selected": _matches_scopes(name, scope_components),
             })
     return rows
 
@@ -83,7 +120,8 @@ def _set_child_module(root, module_name, new_module):
 
 
 def apply_w8a8_fake_quant(model, scope="full",
-                          weight_bits=8, activation_bits=8):
+                          weight_bits=8, activation_bits=8, scopes=None):
+    scope_components = normalize_scopes(scope=scope, scopes=scopes)
     selected = []
 
     # Snapshot first; do not mutate while iterating named_modules().
@@ -93,7 +131,7 @@ def apply_w8a8_fake_quant(model, scope="full",
             continue
         if not isinstance(module, SUPPORTED_TYPES):
             continue
-        if not _matches_scope(name, scope):
+        if not _matches_scopes(name, scope_components):
             continue
         _set_child_module(
             model,
@@ -114,10 +152,13 @@ def apply_w8a8_fake_quant(model, scope="full",
             skipped.append(f"{name}:{module.__class__.__name__}")
 
     return {
-        "scope": scope,
+        "scope": (scope_components[0] if len(scope_components) == 1
+                  else "combined"),
+        "scope_components": scope_components,
         "weight_bits": weight_bits,
         "activation_bits": activation_bits,
         "num_quantized": len(selected),
-        "quantized_modules": selected,
+        "quantized_modules": sorted(selected),
+        "module_set_sha256": module_set_sha256(selected),
         "skipped_conv_like_modules": skipped,
     }

@@ -13,8 +13,12 @@ from torch.utils.data import DataLoader
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import train_utils, inference_utils
 from opencood.tools.quantization.quantize_model import (
+    MULTI_SCOPE_CHOICES,
+    SINGLE_SCOPE_CHOICES,
     apply_w8a8_fake_quant,
     list_quantizable_modules,
+    module_set_sha256,
+    normalize_scopes,
 )
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
@@ -25,6 +29,8 @@ def test_parser():
     parser = argparse.ArgumentParser(description="synthetic data generation")
     parser.add_argument('--model_dir', type=str, required=True,
                         help='Continued training path')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='evaluation output directory; defaults to model_dir')
     parser.add_argument('--fusion_method', type=str,
                         default='intermediate',
                         help='no, no_w_uncertainty, late, early or intermediate')
@@ -40,37 +46,57 @@ def test_parser():
     parser.add_argument('--quant_mode', type=str, default='none',
                         choices=['none', 'w8a8_fake'],
                         help='none or w8a8_fake')
-    parser.add_argument('--quant_scope', type=str, default='full',
-                        choices=['full', 'pillar_vfe', 'backbone',
-                                 'shrink_compression', 'fusion_attention',
-                                 'comm_confidence', 'head', 'combined'],
-                        help='module scope for fake quant')
+    quant_scope_group = parser.add_mutually_exclusive_group()
+    quant_scope_group.add_argument(
+        '--quant_scope', type=str, default=None,
+        choices=SINGLE_SCOPE_CHOICES,
+        help='single module scope for fake quant (legacy-compatible)')
+    quant_scope_group.add_argument(
+        '--quant_scopes', type=str, nargs='+', default=None,
+        choices=MULTI_SCOPE_CHOICES,
+        help='one or more base scopes; selected modules are the set union')
     parser.add_argument('--print_quant_modules', action='store_true',
                         help='print quantizable/selected modules and exit')
     opt = parser.parse_args()
+    try:
+        normalize_scopes(scope=opt.quant_scope, scopes=opt.quant_scopes)
+    except ValueError as exc:
+        parser.error(str(exc))
     return opt
 
 
-def _print_quant_modules(model, scope):
-    rows = list_quantizable_modules(model, scope=scope)
+def _scope_components(opt):
+    return normalize_scopes(scope=opt.quant_scope, scopes=opt.quant_scopes)
+
+
+def _print_quant_modules(model, scope_components):
+    rows = list_quantizable_modules(model, scopes=scope_components)
     print('[Quant] quantizable module list:')
     for row in rows:
         marker = '[x]' if row['selected'] else '[ ]'
         print(f"{marker} {row['name']} ({row['type']})")
-    selected_count = sum(row['selected'] for row in rows)
+    selected_names = sorted(
+        row['name'] for row in rows if row['selected'])
+    selected_count = len(selected_names)
+    print('[Quant] scope_components: {}'.format(
+        ','.join(scope_components)))
+    print('[Quant] num_quantized: {}'.format(selected_count))
+    print('[Quant] module_set_sha256: {}'.format(
+        module_set_sha256(selected_names)))
     print(f"[Quant] selected {selected_count} / {len(rows)} modules "
-          f"for scope={scope}")
+          f"for scopes={','.join(scope_components)}")
 
 
 def _apply_quantization(model, opt):
+    scope_components = _scope_components(opt)
     if opt.print_quant_modules:
-        _print_quant_modules(model, opt.quant_scope)
+        _print_quant_modules(model, scope_components)
         return True
 
     if opt.quant_mode == 'w8a8_fake':
         report = apply_w8a8_fake_quant(
             model,
-            scope=opt.quant_scope,
+            scopes=scope_components,
             weight_bits=8,
             activation_bits=8,
         )
@@ -78,7 +104,7 @@ def _apply_quantization(model, opt):
         print(report)
         if report['num_quantized'] == 0:
             raise RuntimeError(
-                f"quant_scope={opt.quant_scope} selected 0 modules. "
+                f"quant_scopes={scope_components} selected 0 modules. "
                 "Check module names and SCOPE_PATTERNS."
             )
     return False
@@ -89,6 +115,8 @@ def main():
     assert opt.fusion_method in ['late', 'early', 'intermediate', 'intermediate_with_comm', 'no']
 
     hypes = yaml_utils.load_yaml(None, opt)
+    output_dir = opt.output_dir or opt.model_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     if opt.comm_thre is not None:
         hypes['model']['args']['fusion_args']['communication']['thre'] = opt.comm_thre
@@ -186,7 +214,7 @@ def main():
                                        result_stat,
                                        0.7)
             if opt.save_npy:
-                npy_save_path = os.path.join(opt.model_dir, 'npy')
+                npy_save_path = os.path.join(output_dir, 'npy')
                 if not os.path.exists(npy_save_path):
                     os.makedirs(npy_save_path)
                 inference_utils.save_prediction_gt(pred_box_tensor,
@@ -198,7 +226,7 @@ def main():
 
             if opt.save_vis_n and opt.save_vis_n >i:
 
-                vis_save_path = os.path.join(opt.model_dir, 'vis_3d')
+                vis_save_path = os.path.join(output_dir, 'vis_3d')
                 if not os.path.exists(vis_save_path):
                     os.makedirs(vis_save_path)
                 vis_save_path = os.path.join(opt.model_dir, 'vis_3d/3d_%05d.png' % i)
@@ -211,7 +239,7 @@ def main():
                                     left_hand=left_hand,
                                     vis_pred_box=True)
                 
-                vis_save_path = os.path.join(opt.model_dir, 'vis_bev')
+                vis_save_path = os.path.join(output_dir, 'vis_bev')
                 if not os.path.exists(vis_save_path):
                     os.makedirs(vis_save_path)
                 vis_save_path = os.path.join(opt.model_dir, 'vis_bev/bev_%05d.png' % i)
@@ -229,9 +257,9 @@ def main():
         comm_rates = (sum(total_comm_rates)/len(total_comm_rates)).item()
     else:
         comm_rates = 0
-    ap_30, ap_50, ap_70 = eval_utils.eval_final_results(result_stat, opt.model_dir)
+    ap_30, ap_50, ap_70 = eval_utils.eval_final_results(result_stat, output_dir)
     
-    with open(os.path.join(saved_path, 'result.txt'), 'a+') as f:
+    with open(os.path.join(output_dir, 'result.txt'), 'a+') as f:
         msg = 'Epoch: {} | AP @0.3: {:.04f} | AP @0.5: {:.04f} | AP @0.7: {:.04f} | comm_rate: {:.06f}\n'.format(epoch_id, ap_30, ap_50, ap_70, comm_rates)
         if opt.comm_thre is not None:
             msg = 'Epoch: {} | AP @0.3: {:.04f} | AP @0.5: {:.04f} | AP @0.7: {:.04f} | comm_rate: {:.06f} | comm_thre: {:.04f}\n'.format(epoch_id, ap_30, ap_50, ap_70, comm_rates, opt.comm_thre)
